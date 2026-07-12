@@ -1,10 +1,11 @@
 const http = require('http');
 const https = require('https');
 const url = require('url');
+const zlib = require('zlib');
 
 const PORT = process.env.PORT || 3000;
 
-// Простая страница-приветствие, если зашли без параметров
+// Страница-приветствие
 const landingHTML = `
 <!DOCTYPE html>
 <html>
@@ -24,27 +25,25 @@ const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const targetUrl = parsedUrl.query.url;
 
-  // Endpoint для проверки здоровья (Render Health Check)
+  // Health check для Render
   if (parsedUrl.pathname === '/healthz') {
     res.writeHead(200);
     res.end('OK');
     return;
   }
 
-  // Если нет параметра url — показываем форму
   if (!targetUrl) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(landingHTML.replace('ВАШ_СЕРВЕР', req.headers.host));
     return;
   }
 
-  // Обрабатываем WebSocket (Telegram)
+  // Обработка WebSocket (Telegram чаты)
   if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
     handleWebSocket(req, res, targetUrl);
     return;
   }
 
-  // Парсим целевой URL
   const target = url.parse(targetUrl);
   if (!target.protocol || !['http:', 'https:'].includes(target.protocol)) {
     res.writeHead(400);
@@ -52,7 +51,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Формируем запрос к целевому серверу
   const options = {
     hostname: target.hostname,
     port: target.port || (target.protocol === 'https:' ? 443 : 80),
@@ -74,35 +72,62 @@ const server = http.createServer((req, res) => {
         } else if (location.startsWith('/')) {
           newLocation = `/?url=${encodeURIComponent(target.protocol + '//' + target.host + location)}`;
         } else {
-          newLocation = location; // браузер сам разрулит
+          newLocation = location;
         }
         proxyRes.headers.location = newLocation;
       }
     }
 
-    // Копируем заголовки, удаляем лишние
-    const responseHeaders = { ...proxyRes.headers };
-    delete responseHeaders['transfer-encoding'];
-    delete responseHeaders['content-encoding']; // чтобы не испортить тело
-    res.writeHead(proxyRes.statusCode, responseHeaders);
-
-    // Если HTML или JavaScript — подменяем ссылки
-    let body = '';
-    proxyRes.on('data', chunk => body += chunk);
+    // Определяем, сжато ли тело
+    const encoding = proxyRes.headers['content-encoding'];
+    let chunks = [];
+    proxyRes.on('data', chunk => chunks.push(chunk));
     proxyRes.on('end', () => {
-      const contentType = responseHeaders['content-type'] || '';
-      if (contentType.includes('text/html') || contentType.includes('application/javascript') || contentType.includes('text/css')) {
-        // Заменяем абсолютные URL
-        body = body.replace(/(href|src|action)="(https?:\/\/[^"]+)"/gi, (match, attr, link) => {
-          return `${attr}="/?url=${encodeURIComponent(link)}"`;
-        });
-        // Заменяем относительные URL, начинающиеся с /
-        body = body.replace(/(href|src|action)="(\/[^"]*)"/gi, (match, attr, link) => {
-          const absUrl = `${target.protocol}//${target.host}${link}`;
-          return `${attr}="/?url=${encodeURIComponent(absUrl)}"`;
-        });
-      }
-      res.end(body);
+      let buffer = Buffer.concat(chunks);
+
+      // Функция для распаковки
+      const decompress = (buf, enc, cb) => {
+        if (!enc) return cb(null, buf);
+        const encLower = enc.toLowerCase();
+        if (encLower.includes('gzip')) {
+          zlib.gunzip(buf, cb);
+        } else if (encLower.includes('deflate')) {
+          zlib.inflate(buf, cb);
+        } else if (encLower.includes('br')) {
+          zlib.brotliDecompress(buf, cb);
+        } else {
+          cb(null, buf); // неизвестный, оставляем как есть
+        }
+      };
+
+      decompress(buffer, encoding, (err, decompressed) => {
+        if (err) {
+          res.writeHead(502);
+          res.end('Ошибка распаковки');
+          return;
+        }
+        const responseHeaders = { ...proxyRes.headers };
+        delete responseHeaders['transfer-encoding'];
+        // Убираем сжатие, т.к. отдаём уже распакованное
+        delete responseHeaders['content-encoding'];
+
+        const contentType = responseHeaders['content-type'] || '';
+        let bodyStr = decompressed.toString('utf-8');
+
+        // Подменяем ссылки в HTML/JS/CSS
+        if (contentType.includes('text/html') || contentType.includes('application/javascript') || contentType.includes('text/css')) {
+          bodyStr = bodyStr.replace(/(href|src|action)="(https?:\/\/[^"]+)"/gi, (match, attr, link) => {
+            return `${attr}="/?url=${encodeURIComponent(link)}"`;
+          });
+          bodyStr = bodyStr.replace(/(href|src|action)="(\/[^"]*)"/gi, (match, attr, link) => {
+            const absUrl = `${target.protocol}//${target.host}${link}`;
+            return `${attr}="/?url=${encodeURIComponent(absUrl)}"`;
+          });
+        }
+
+        res.writeHead(proxyRes.statusCode, responseHeaders);
+        res.end(bodyStr);
+      });
     });
   });
 
@@ -111,7 +136,6 @@ const server = http.createServer((req, res) => {
     res.end('Прокси-ошибка: ' + err.message);
   });
 
-  // Пересылаем тело POST/PUT запросов
   if (req.method === 'POST' || req.method === 'PUT') {
     let body = '';
     req.on('data', chunk => body += chunk);
@@ -121,17 +145,16 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// Обработка WebSocket
-function handleWebSocket(clientReq, clientSocket, head, targetUrlStr) {
+// WebSocket прокси (упрощённый, без сжатия)
+function handleWebSocket(req, socket, head, targetUrlStr) {
   const target = url.parse(targetUrlStr);
-  const wsUrl = `${target.protocol === 'https:' ? 'wss:' : 'ws:'}//${target.host}${target.path}`;
   const proxyReq = (target.protocol === 'https:' ? https : http).request({
     hostname: target.hostname,
     port: target.port || (target.protocol === 'https:' ? 443 : 80),
     path: target.path,
     method: 'GET',
     headers: {
-      ...clientReq.headers,
+      ...req.headers,
       host: target.hostname,
       upgrade: 'websocket',
       connection: 'Upgrade',
@@ -139,14 +162,12 @@ function handleWebSocket(clientReq, clientSocket, head, targetUrlStr) {
   });
 
   proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
-    proxySocket.write(proxyHead);
-    clientSocket.write(proxyHead);
-    proxySocket.pipe(clientSocket);
-    clientSocket.pipe(proxySocket);
+    socket.write(proxyHead);
+    proxySocket.pipe(socket).pipe(proxySocket);
   });
 
   proxyReq.on('error', (err) => {
-    clientSocket.end();
+    socket.end();
   });
 
   proxyReq.end();
